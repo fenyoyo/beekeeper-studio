@@ -48,8 +48,16 @@ const configWatchers = {}
 // call this, and 500ms is enough to coalesce their finish into one
 // electron restart.
 const restartElectron = _.debounce(() => {
-  if (electron) {
-    process.kill(electron.pid, 'SIGINT')
+  const previous = electron
+
+  if (previous) {
+    // We're killing this instance on purpose. Drop its exit handler first: on
+    // Windows a killed child reports `signal === null`, which is
+    // indistinguishable from the user closing the window, so the handler
+    // registered below would call process.exit() and take the whole watcher
+    // down with it.
+    previous.removeAllListeners('exit')
+    process.kill(previous.pid, 'SIGINT')
   }
   // start electron again
   electron = spawn(electronBin, ['.'], { stdio: 'inherit' })
