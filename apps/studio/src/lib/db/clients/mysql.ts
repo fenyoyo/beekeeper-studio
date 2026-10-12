@@ -98,6 +98,42 @@ const mysqlErrors = {
   CONNECTION_LOST: "PROTOCOL_CONNECTION_LOST",
 };
 
+/**
+ * Errors meaning the socket is gone. MySQL closes idle sessions after
+ * `wait_timeout`, and mysql2 reports PROTOCOL_CONNECTION_LOST when it then
+ * writes to that already-closed socket. In that case the statement never
+ * reached the server, so replaying it on a fresh connection is safe.
+ */
+const connectionLostCodes = new Set([
+  "PROTOCOL_CONNECTION_LOST",
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+/** How long a pooled connection may sit idle before we re-validate it. */
+const IDLE_VALIDATION_THRESHOLD = 5000;
+
+/** How many dead pooled connections to discard during a single checkout. */
+const MAX_DEAD_CONNECTION_SWAPS = 3;
+
+function isConnectionLostError(err: any): boolean {
+  if (!err) {
+    return false;
+  }
+
+  // A query the user cancelled - or killed from another session - also comes
+  // back as a lost connection. Never replay those.
+  if (
+    err.code === "CANCELED_BY_USER" ||
+    err.sqlectronError === "CANCELED_BY_USER"
+  ) {
+    return false;
+  }
+
+  return connectionLostCodes.has(err.code);
+}
+
 const knex = knexlib({ client: "mysql2" });
 
 function getRealError(conn, err) {
@@ -216,6 +252,12 @@ export class MysqlClient extends BasicDatabaseClient<ResultType, mysql.PoolConne
   interval: NodeJS.Timeout
 
   clientId: string
+
+  /** When each pooled connection was last handed back, for idle validation. */
+  private readonly connectionIdleSince = new WeakMap<mysql.PoolConnection, number>();
+
+  /** Connections that already have our 'error' logger attached. */
+  private readonly loggedConnections = new WeakSet<mysql.PoolConnection>();
 
   constructor(server: IDbConnectionServer, database: IDbConnectionDatabase) {
     super(knex, context, server, database);
@@ -1238,33 +1280,119 @@ export class MysqlClient extends BasicDatabaseClient<ResultType, mysql.PoolConne
       : this.runWithConnection(runQuery);
   }
 
-  async runWithConnection<T>(run: (connection: mysql.PoolConnection) => Promise<T>, tabId?: number): Promise<T> {
-    const { pool } = this.conn;
-    const hasReserved = this.reservedConnections.has(tabId);
-    let conn: mysql.PoolConnection;
-    if (hasReserved) {
-      conn = this.reservedConnections.get(tabId);
-    } else {
-      conn = await new Promise((resolve, reject) => {
-        pool.getConnection((err, connection) => {
-          if (err) {
-            reject(err);
-          }
-          resolve(connection);
-        })
-      });
-    }
-
-    conn.on("error", (error) => {
-      logger().error("Connection fatal error %j", error);
-    });
+  /**
+   * Checks a pooled connection out, runs `run` on it and hands it back.
+   * Connections that turn out to be dead are destroyed instead of released, so
+   * the pool doesn't keep handing the same corpse out.
+   */
+  private async runOnPooledConnection<T>(
+    run: (connection: mysql.PoolConnection) => Promise<T>
+  ): Promise<T> {
+    const conn = await this.acquireLiveConnection();
 
     try {
-      return await run(conn);
-    } finally {
-      if (!hasReserved) {
-        conn.release();
+      const result = await run(conn);
+      this.releaseToPool(conn);
+      return result;
+    } catch (ex) {
+      if (isConnectionLostError(ex)) {
+        this.discardConnection(conn);
+      } else {
+        this.releaseToPool(conn);
       }
+      throw ex;
+    }
+  }
+
+  async runWithConnection<T>(run: (connection: mysql.PoolConnection) => Promise<T>, tabId?: number): Promise<T> {
+    // A tab with a reserved connection owns an open transaction on it. Never
+    // swap or replay work there: the transaction only exists on that exact
+    // connection, so losing it has to surface as an error.
+    if (this.reservedConnections.has(tabId)) {
+      const conn = this.reservedConnections.get(tabId) as mysql.PoolConnection;
+      return await run(conn);
+    }
+
+    try {
+      return await this.runOnPooledConnection(run);
+    } catch (ex) {
+      if (!isConnectionLostError(ex)) {
+        throw ex;
+      }
+      logger().warn("Connection lost, retrying once %j", ex);
+      return await this.runOnPooledConnection(run);
+    }
+  }
+
+  /**
+   * mysql2 hands pooled connections out without checking that they are still
+   * alive, and it never reaps idle ones: its idle reaper is only started when
+   * `maxIdle < connectionLimit`, and `maxIdle` defaults to `connectionLimit`
+   * (see lib/base/pool.js). A connection MySQL closed while sitting past
+   * `wait_timeout` therefore comes back looking healthy. Ping connections that
+   * have been idle for a while and swap the dead ones out before use.
+   */
+  private async acquireLiveConnection(): Promise<mysql.PoolConnection> {
+    for (let swap = 0; ; swap++) {
+      const conn = await this.checkoutConnection();
+      const idleFor = Date.now() - (this.connectionIdleSince.get(conn) ?? Date.now());
+
+      if (idleFor < IDLE_VALIDATION_THRESHOLD || await this.ping(conn)) {
+        return conn;
+      }
+
+      logger().warn("Discarding pooled connection idle for %dms", idleFor);
+      this.discardConnection(conn);
+
+      if (swap >= MAX_DEAD_CONNECTION_SWAPS - 1) {
+        // Stop swapping: either the pool has no stale connections left or the
+        // server is unreachable. Let the caller's query report the real error.
+        return await this.checkoutConnection();
+      }
+    }
+  }
+
+  private checkoutConnection(): Promise<mysql.PoolConnection> {
+    return new Promise((resolve, reject) => {
+      this.conn.pool.getConnection((err, conn) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+
+        if (!this.loggedConnections.has(conn)) {
+          this.loggedConnections.add(conn);
+          conn.on("error", (error) => {
+            logger().error("Connection fatal error %j", error);
+          });
+        }
+
+        resolve(conn);
+      });
+    });
+  }
+
+  private ping(conn: mysql.PoolConnection): Promise<boolean> {
+    return new Promise((resolve) => {
+      try {
+        conn.ping((err) => resolve(!err));
+      } catch (_e) {
+        resolve(false);
+      }
+    });
+  }
+
+  private releaseToPool(conn: mysql.PoolConnection) {
+    this.connectionIdleSince.set(conn, Date.now());
+    conn.release();
+  }
+
+  private discardConnection(conn: mysql.PoolConnection) {
+    this.connectionIdleSince.delete(conn);
+    try {
+      conn.destroy();
+    } catch (e) {
+      logger().error("Could not destroy dead connection %j", e);
     }
   }
 
@@ -1528,25 +1656,21 @@ export class MysqlClient extends BasicDatabaseClient<ResultType, mysql.PoolConne
       throw new Error(errorMessages.maxReservedConnections)
     }
 
-    return new Promise((resolve, reject) => {
-      this.conn.pool.getConnection((err, conn) => {
-        if (!err) {
-          try {
-            this.pushConnection(tabId, conn);
-            resolve();
-          } catch (e) {
-            reject(e);
-          }
-        }
-        reject(err);
-      })
-    })
+    const conn = await this.acquireLiveConnection();
+    try {
+      this.pushConnection(tabId, conn);
+    } catch (e) {
+      this.releaseToPool(conn);
+      throw e;
+    }
   }
 
   async releaseConnection(tabId: number): Promise<void> {
     const conn = this.popConnection(tabId);
     if (conn) {
-      conn.release();
+      // Goes back to the pool, so it needs idle validation on its next checkout
+      // like any other pooled connection.
+      this.releaseToPool(conn as mysql.PoolConnection);
     }
   }
 
