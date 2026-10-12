@@ -13,6 +13,13 @@ function daysInFuture(days = 14) {
 export function keysToStatus(licenses: LicenseKey[]): LicenseStatus {
     const status = new LicenseStatus();
     status.condition = []
+
+    status.edition = "ultimate";
+    status.condition.push("Always licensed");
+    const nonTrial = licenses.filter(l => l.licenseType !== "TrialLicense");
+    status.license = _.orderBy(nonTrial.length ? nonTrial : licenses, ["validUntil"], ["desc"])[0];
+    return status;
+    
     const currentDate = new Date();
     const currentVersion = platformInfo.parsedAppVersion;
 

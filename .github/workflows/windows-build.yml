@@ -1,0 +1,91 @@
+name: Windows Build
+
+# Builds the Windows installers (NSIS setup + portable exe) and uploads them as
+# a workflow artifact. Unsigned unless GCP KMS signing secrets are configured
+# (see build/win/sign.js) - fine for testing.
+#
+# master/main already get a Windows build from studio-build-non-production.yml,
+# so this workflow only runs on dev to avoid duplicate heavy builds.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - 'apps/sqltools/**'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v5
+
+      - name: Install python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.11
+
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+
+      # ImageOS identifies the runner image (e.g. win22), so caches never cross
+      # runner image versions: node_modules holds native modules compiled for
+      # one exact image.
+      - name: Compute runner image cache id
+        shell: bash
+        run: echo "RUNNER_IMAGE_ID=${ImageOS:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Cache node_modules
+        id: cache-nm
+        uses: actions/cache@v5
+        with:
+          path: |
+            node_modules
+            apps/studio/node_modules
+            apps/ui-kit/node_modules
+            apps/sqltools/node_modules
+          key: node-modules-${{ env.RUNNER_IMAGE_ID }}-${{ runner.arch }}-${{ hashFiles('.nvmrc') }}-${{ hashFiles('yarn.lock') }}
+
+      # For msnodesqlv8, if it previously failed in the cached version, clear
+      # the cache and try again :)
+      - name: Check restored node_modules
+        id: nm-health
+        if: steps.cache-nm.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: node -e "require('msnodesqlv8')"
+
+      - name: Discard broken node_modules
+        if: steps.nm-health.outcome == 'failure'
+        shell: bash
+        run: rm -rf node_modules apps/studio/node_modules apps/ui-kit/node_modules apps/sqltools/node_modules
+
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true' || steps.nm-health.outcome == 'failure'
+        run: yarn install --frozen-lockfile --network-timeout 100000
+        env:
+          npm_config_node_gyp: ${{ github.workspace }}\node_modules\node-gyp\bin\node-gyp.js
+
+      - name: Build Windows installers
+        run: yarn run electron:build --publish never
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-installers
+          if-no-files-found: error
+          path: |
+            apps/studio/dist_electron/*.exe
